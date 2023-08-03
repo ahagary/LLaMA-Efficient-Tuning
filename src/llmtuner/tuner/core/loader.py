@@ -1,6 +1,6 @@
 import os
 import torch
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 from transformers import (
     AutoConfig,
@@ -15,11 +15,14 @@ from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 from trl import AutoModelForCausalLMWithValueHead
 
-from llmtuner.extras.logging import get_logger
-from llmtuner.extras.misc import prepare_model_for_training, print_trainable_params
+from llmtuner.extras.logging import reset_logging, get_logger
+from llmtuner.extras.misc import count_parameters, prepare_model_for_training
 from llmtuner.extras.save_and_load import load_valuehead_params
-from llmtuner.hparams import ModelArguments, FinetuningArguments
+from llmtuner.hparams import FinetuningArguments
 from llmtuner.tuner.core.adapter import init_adapter
+
+if TYPE_CHECKING:
+    from llmtuner.hparams import ModelArguments
 
 
 logger = get_logger(__name__)
@@ -33,8 +36,8 @@ require_version("trl>=0.4.7", "To fix: pip install trl>=0.4.7")
 
 
 def load_model_and_tokenizer(
-    model_args: ModelArguments,
-    finetuning_args: FinetuningArguments,
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
     is_trainable: Optional[bool] = False,
     stage: Optional[Literal["pt", "sft", "rm", "ppo"]] = "sft"
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
@@ -90,11 +93,13 @@ def load_model_and_tokenizer(
             )
 
         is_mergeable = False
-        config_kwargs["device_map"] = {"": int(os.environ.get("LOCAL_RANK", "0"))}
         logger.info("Quantizing model to {} bit.".format(model_args.quantization_bit))
 
-    if not is_trainable: # `device_map=auto` should be used for inference only
-        config_kwargs["device_map"] = "auto"
+    if (
+        model_args.quantization_bit is not None
+        or (os.environ.get('LOCAL_RANK') is not None and not is_deepspeed_zero3_enabled())
+    ):
+        config_kwargs["device_map"] = {"": int(os.environ.get("LOCAL_RANK", "0"))}
 
     if model_args.checkpoint_dir is not None and finetuning_args.finetuning_type == "full":
         model_to_load = model_args.checkpoint_dir[0]
@@ -124,6 +129,7 @@ def load_model_and_tokenizer(
 
     if stage == "rm" or stage == "ppo": # add value head
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+        reset_logging()
 
         if stage == "rm" and model_args.checkpoint_dir is not None: # load valuehead weights to evaluate reward model
             logger.warning("Only the last checkpoint containing valuehead will be loaded as the valuehead.")
@@ -144,6 +150,9 @@ def load_model_and_tokenizer(
         model.requires_grad_(False) # fix all model params
         model = model.half() if model_args.quantization_bit is None else model # cast from fp32 to fp16
 
-    print_trainable_params(model)
+    trainable_params, all_param = count_parameters(model)
+    logger.info("trainable params: {:d} || all params: {:d} || trainable%: {:.4f}".format(
+        trainable_params, all_param, 100 * trainable_params / all_param
+    ))
 
     return model, tokenizer
